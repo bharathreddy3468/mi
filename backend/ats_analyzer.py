@@ -3,7 +3,7 @@ import logging
 import json
 from typing import Dict, Any
 
-def analyze_resume_vs_jd(groq_client, resume_text: str, job_description: str, model: str = "llama-3.1-8b-instant") -> Dict[str, Any]:
+def analyze_resume_vs_jd(groq_client, resume_text: str, job_description: str, model: str = "openain/gpt-oss-120b") -> Dict[str, Any]:
     """
     Analyze resume against job description using LLM
     Returns detailed analysis with match percentage, strengths, gaps, etc.
