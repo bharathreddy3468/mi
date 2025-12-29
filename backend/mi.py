@@ -30,37 +30,9 @@ from fastapi.responses import StreamingResponse
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-from ai_tutor import chat_with_ai_tutor
-from ats_analyzer import analyze_resume_vs_jd, create_fallback_ats_analysis
-
-import sys
-
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
-
-# Run startup health checks
-def run_startup_checks():
-    """Run startup health checks and system setup"""
-    try:
-        result = subprocess.run(
-            ['bash', '/app/startup_checks.sh'],
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-        print(result.stdout)
-        if result.stderr:
-            print(result.stderr, file=sys.stderr)
-        if result.returncode != 0:
-            logging.error("Startup checks failed with code: " + str(result.returncode))
-    except Exception as e:
-        logging.error(f"Failed to run startup checks: {e}")
-
-# Run checks on import
-run_startup_checks()
-
-# Continue with normal setup
 db = client[os.environ['DB_NAME']]
 
 # Initialize Groq client
@@ -118,7 +90,6 @@ class InterviewSession(BaseModel):
 
 class QuestionAnswerCreate(BaseModel):
     question_id: str
-    question_text: str  # The actual question text that was asked
     audio_data: str  # Base64 encoded audio
 
 class NextQuestionResponse(BaseModel):
@@ -255,11 +226,8 @@ def convert_webm_to_wav(webm_data: bytes) -> Tuple[Optional[str], bool, Optional
     Convert WebM bytes to WAV using ffmpeg subprocess, robustly detect 'no audio' cases.
     Returns (wav_path, success, message)
     """
-    logging.info("=== Audio Conversion Started ===")
-    logging.info(f"Input: {len(webm_data) if webm_data else 0} bytes of WebM data")
-    
     if not webm_data or len(webm_data) == 0:
-        logging.warning("No audio bytes provided — creating a small silent WAV fallback.")
+        logging.info("No audio bytes provided — creating a small silent WAV fallback.")
         silent_audio = AudioSegment.silent(duration=1000)  # 1s silence
         wav_path = tempfile.mktemp(suffix=".wav")
         silent_audio.export(wav_path, format="wav")
@@ -274,32 +242,21 @@ def convert_webm_to_wav(webm_data: bytes) -> Tuple[Optional[str], bool, Optional
             webm_temp.flush()
             webm_path = webm_temp.name
 
-        webm_size = os.path.getsize(webm_path)
-        logging.info(f"✓ Saved WebM to: {webm_path} ({webm_size} bytes)")
-
-        # Check if ffmpeg is available
-        try:
-            subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-            logging.info("✓ FFmpeg is available")
-        except FileNotFoundError:
-            logging.error("✗ CRITICAL: FFmpeg not found! Audio conversion will fail.")
-            raise Exception("FFmpeg not installed")
+        logging.info(f"Saved incoming webm to {webm_path} ({os.path.getsize(webm_path)} bytes)")
 
         # Use ffprobe to check whether there is any audio stream
         try:
             probe_cmd = ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "default=nw=1", webm_path]
             probe = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            logging.info(f"✓ FFprobe check complete")
-            logging.debug(f"  ffprobe stdout: {probe.stdout}")
-            logging.debug(f"  ffprobe stderr: {probe.stderr}")
+            logging.debug(f"ffprobe stdout: {probe.stdout}; stderr: {probe.stderr}")
             has_audio = bool(probe.stdout.strip())
         except FileNotFoundError:
             # ffprobe missing — we'll attempt ffmpeg conversion anyway
-            logging.warning("⚠ ffprobe not found; attempting ffmpeg conversion directly.")
+            logging.warning("ffprobe not found; attempting ffmpeg conversion directly.")
             has_audio = True
 
         if not has_audio:
-            logging.warning("✗ No audio stream found in WebM file. Creating silent WAV fallback.")
+            logging.info("No audio stream found in uploaded webm. Returning silent WAV fallback.")
             silent_audio = AudioSegment.silent(duration=1000)
             wav_path = tempfile.mktemp(suffix=".wav")
             silent_audio.export(wav_path, format="wav")
@@ -1337,18 +1294,20 @@ async def submit_question_answer(session_id: str, answer_data: QuestionAnswerCre
                 except Exception as cleanup_error:
                     logging.warning(f"Failed to clean up temp file: {cleanup_error}")
         
-        # Get the setup for validation
+        # Get the setup to retrieve question text
         setup = await db.interview_setups.find_one({"id": session['setup_id']}, {"_id": 0})
-        if not setup:
-            raise HTTPException(status_code=404, detail="Interview setup not found")
         
-        # Use the actual question text that was asked (passed from frontend)
-        question_text = answer_data.question_text
+        # Regenerate the question text for this question_index
+        question_text = generate_next_question(
+            setup,
+            session['answered_questions'][:session['current_question_index']],
+            session['current_question_index']
+        )
         
         # Add answer to session
         answer_record = {
             "question_id": answer_data.question_id,
-            "question_text": question_text,  # Store the ACTUAL question that was asked
+            "question_text": question_text,  # Store the question text
             "question_index": session['current_question_index'],
             "transcript": transcript,
             "timestamp": datetime.now(timezone.utc).isoformat()
@@ -1430,7 +1389,9 @@ async def end_interview_session(session_id: str):
         logging.error(f"Session end error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# CORS Middleware Configuration
+# Include the router in the main app
+app.include_router(api_router)
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
@@ -1445,75 +1406,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-
-
-# ============================================
-# AI TUTOR ENDPOINTS
-# ============================================
-
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-
-class ChatRequest(BaseModel):
-    messages: List[ChatMessage]
-
-@api_router.post("/ai-tutor/chat")
-async def ai_tutor_chat(request: ChatRequest):
-    """AI Tutor chat endpoint for career guidance and interview prep"""
-    try:
-        # Convert Pydantic models to dicts for Groq
-        messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
-        
-        # Get response from AI Tutor - pass groq_client
-        response = chat_with_ai_tutor(groq_client, messages)
-        
-        logging.info("AI Tutor chat response generated successfully")
-        return {"response": response, "success": True}
-        
-    except Exception as e:
-        logging.error(f"AI Tutor chat error: {type(e).__name__}: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to get response from AI Tutor")
-
-# ============================================
-# ATS ANALYZER ENDPOINTS
-# ============================================
-
-@api_router.post("/ats/analyze")
-async def analyze_resume_ats(
-    job_description: str = Form(...),
-    resume_file: UploadFile = File(...)
-):
-    """Analyze resume against job description using ATS"""
-    try:
-        # Read and parse resume
-        file_content = await resume_file.read()
-        
-        if resume_file.filename.lower().endswith('.pdf'):
-            resume_text = extract_text_from_pdf(file_content)
-        elif resume_file.filename.lower().endswith(('.docx', '.doc')):
-            resume_text = extract_text_from_docx(file_content)
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported file format. Please upload PDF or DOCX.")
-        
-        if not resume_text.strip():
-            raise HTTPException(status_code=400, detail="Could not extract text from resume file.")
-        
-        # Perform ATS analysis - pass groq_client
-        analysis = analyze_resume_vs_jd(groq_client, resume_text, job_description)
-        
-        logging.info(f"ATS analysis complete. Match: {analysis.get('match_percentage', 0)}%")
-        return analysis
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"ATS analysis endpoint error: {type(e).__name__}: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to analyze resume")
-
-# Include the API router in the main app (MUST be after all endpoint definitions)
-app.include_router(api_router)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
